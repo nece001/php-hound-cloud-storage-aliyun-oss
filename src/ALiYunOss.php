@@ -121,12 +121,43 @@ class ALiYunOss extends ObjectStorage implements IStorage
         if ($this->isFile($src)) {
             $this->client->copyObject($this->bucket, $src, $this->bucket, $dst);
         } else {
-            $list = $this->scandir($src);
-            foreach ($list as $key) {
-                $from_key = $this->dirPath($from) . $key;
-                $new_key = $this->dirPath($to) . $key;
+            $src = $this->dirPath($from);
+            $dst = $this->dirPath($to);
 
-                $this->copy($from_key, $new_key);
+            $next_marker = '';
+            while (true) {
+                $options = array(
+                    OssClient::OSS_PREFIX => rtrim($src, '/'),
+                    OssClient::OSS_DELIMITER => '',
+                    OssClient::OSS_MARKER => $next_marker,
+                    OssClient::OSS_MAX_KEYS => 1000,
+                );
+
+                $result = $this->client->listObjects($this->bucket, $options);
+
+                $next_marker = $result->getNextMarker();
+                $prefixList = $result->getPrefixList();
+                $objectList = $result->getObjectList();
+
+                if ($prefixList) {
+                    foreach ($prefixList as $prefix) {
+                        $src_key = $prefix->getPrefix();
+                        $dst_key = $dst . substr($src_key, strlen($src));
+                        $this->mkdir($dst_key);
+                    }
+                }
+
+                if ($objectList) {
+                    foreach ($objectList as $object) {
+                        $src_key = $object->getKey();
+                        $dst_key = $dst . substr($src_key, strlen($src));
+                        $this->client->copyObject($this->bucket, $src_key, $this->bucket, $dst_key);
+                    }
+                }
+
+                if (!$next_marker) {
+                    break;
+                }
             }
         }
 
@@ -204,13 +235,15 @@ class ALiYunOss extends ObjectStorage implements IStorage
     /**
      * @inheritdoc
      */
-    public function scandir(string $path, int $order = Consts::SCANDIR_SORT_ASCENDING): array
+    public function list(string $path, int $order = Consts::SCANDIR_SORT_ASCENDING, string $next_marker = '', $max_keys = 1000): array
     {
         $directory = $this->dirPath($path);
 
         $options = array(
             OssClient::OSS_PREFIX => '/' == $directory ? '' : $directory,
             OssClient::OSS_DELIMITER => '/',
+            OssClient::OSS_MARKER => $next_marker,
+            OssClient::OSS_MAX_KEYS => $max_keys,
         );
 
         $result = $this->client->listObjects($this->bucket, $options);
@@ -225,7 +258,8 @@ class ALiYunOss extends ObjectStorage implements IStorage
                     $prefix = substr($prefix, strlen($directory));
                 }
                 if ($prefix) {
-                    $list[] = trim($prefix, '/');
+                    $name = trim($prefix, '/');
+                    $list[] = $this->buildObjectListItem($name, 0, true, 0, 0, 0);
                 }
             }
         }
@@ -233,12 +267,14 @@ class ALiYunOss extends ObjectStorage implements IStorage
         if ($objectList) {
             foreach ($objectList as $object) {
                 $key = $object->getKey();
+                $name = $key;
                 if ($directory && 0 === strpos($key, $directory)) {
-                    $key = substr($key, strlen($directory));
+                    $name = substr($key, strlen($directory));
                 }
 
-                if ($key) {
-                    $list[] = $key;
+                if ($name) {
+                    $mtime = strtotime($object->getLastModified());
+                    $list[] = $this->buildObjectListItem($name, $object->getSize(), false, $mtime, $mtime, $mtime);
                 }
             }
         }
@@ -270,29 +306,52 @@ class ALiYunOss extends ObjectStorage implements IStorage
     {
         $from = $this->keyPath($src);
         if ($this->isFile($from)) {
-            $options = array(
-                OssClient::OSS_FILE_DOWNLOAD => $local_dst
-            );
-
-            $this->client->getObject($this->bucket, $from, $options);
+            $this->downloadFile($from, $local_dst);
         } else {
-            if (!file_exists($local_dst)) {
-                mkdir($local_dst, 0755, true);
-            }
+            $src = $this->dirPath($from);
 
-            $objects = $this->scandir($from);
-            foreach ($objects as $name) {
-                $key = $this->keyPath($from . $name);
-                $file = $local_dst . DIRECTORY_SEPARATOR . $name;
+            $next_marker = '';
+            while (true) {
+                $options = array(
+                    OssClient::OSS_PREFIX => rtrim($src, '/'),
+                    OssClient::OSS_DELIMITER => '',
+                    OssClient::OSS_MARKER => $next_marker,
+                    OssClient::OSS_MAX_KEYS => 1000,
+                );
 
-                if ($this->isFile($key)) {
-                    $options = array(
-                        OssClient::OSS_FILE_DOWNLOAD => $file
-                    );
+                $result = $this->client->listObjects($this->bucket, $options);
 
-                    $this->client->getObject($this->bucket, $key, $options);
-                } else {
-                    $this->download($key, $file);
+                $next_marker = $result->getNextMarker();
+                $prefixList = $result->getPrefixList();
+                $objectList = $result->getObjectList();
+
+                if ($prefixList) {
+                    foreach ($prefixList as $prefix) {
+                        $src_key = $prefix->getPrefix();
+                        $dst_dir = $local_dst . DIRECTORY_SEPARATOR . substr($src_key, strlen($src));
+                        if (!file_exists($dst_dir)) {
+                            mkdir($dst_dir, 0755, true);
+                        }
+                    }
+                }
+
+                if ($objectList) {
+                    foreach ($objectList as $object) {
+                        $src_key = $object->getKey();
+                        $dst_file = $local_dst . DIRECTORY_SEPARATOR . substr($src_key, strlen($src));
+                        $dst_file = str_replace('/', DIRECTORY_SEPARATOR, $dst_file);
+
+                        $dir = dirname($dst_file);
+                        if (!file_exists($dir)) {
+                            mkdir($dir, 0755, true);
+                        }
+
+                        $this->downloadFile($src_key, $dst_file);
+                    }
+                }
+
+                if (!$next_marker) {
+                    break;
                 }
             }
         }
@@ -334,6 +393,25 @@ class ALiYunOss extends ObjectStorage implements IStorage
             return '';
         }
         return $meta['info']['url'];
+    }
+
+    /**
+     * 下载文件到本地目录
+     *
+     * @author nece001@163.com
+     * @create 2026-04-02 09:41:22
+     *
+     * @param string $key
+     * @param string $local_file
+     * @return string|null
+     */
+    private function downloadFile(string $key, string $local_file)
+    {
+        $options = array(
+            OssClient::OSS_FILE_DOWNLOAD => $local_file
+        );
+
+        return $this->client->getObject($this->bucket, $key, $options);
     }
 
     /**
